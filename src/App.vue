@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import OmList from "./components/OmList.vue";
-import { OmRecordDTO } from "./types/om";
+import { OmRecordDTO, SyncResult } from "./types/om";
 
 interface UniversalSuggestion {
   id: string;
@@ -22,6 +22,30 @@ const cachePath = ref("");
 const cacheInfo = ref("");
 const forceRefresh = ref(false);
 const lastKeyword = ref("");
+const syncing = ref(false);
+const lastSyncResult = ref<SyncResult | null>(null);
+const syncError = ref<string | null>(null);
+const timezoneMode = ref<"UTC" | "BEIJING">("UTC");
+
+const formattedCacheInfo = computed(() => {
+  if (!cacheInfo.value) return "Last Sync: —";
+  // 匹配 ISO (带T带Z) 或已格式化 (空格分隔) 的时间戳
+  const m = cacheInfo.value.match(/(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+  if (!m) return cacheInfo.value;
+  const d = new Date(m[1] + 'T' + m[2] + 'Z');
+  if (isNaN(d.getTime())) return cacheInfo.value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const fmt = (y:number, mo:number, da:number, h:number, mi:number, s:number, tz:string) =>
+    `Last Sync: ${y}-${pad(mo)}-${pad(da)} ${pad(h)}:${pad(mi)}:${pad(s)} ${tz}`;
+  if (timezoneMode.value === "UTC") {
+    return fmt(d.getUTCFullYear(), d.getUTCMonth()+1, d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), "UTC");
+  }
+  if (timezoneMode.value === "BEIJING") {
+    const bj = new Date(d.getTime() + 8*3600000);
+    return fmt(bj.getUTCFullYear(), bj.getUTCMonth()+1, bj.getUTCDate(), bj.getUTCHours(), bj.getUTCMinutes(), bj.getUTCSeconds(), "UTC+8");
+  }
+  return fmt(d.getUTCFullYear(), d.getUTCMonth()+1, d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), "UTC");
+});
 
 const updateCacheInfo = async () => {
   try { cacheInfo.value = await invoke<string>("get_cache_info"); } catch { cacheInfo.value = "?"; }
@@ -30,6 +54,23 @@ const updateCacheInfo = async () => {
 const executeRefresh = () => {
   if (lastKeyword.value) {
     executeFinalQuery(lastKeyword.value);
+  }
+};
+
+const syncNow = async () => {
+  syncing.value = true;
+  syncError.value = null;
+  lastSyncResult.value = null;
+  try {
+    lastSyncResult.value = await invoke<SyncResult>("sync_incremental", { 
+      since: null, 
+      controller: "om" 
+    });
+    updateCacheInfo();
+  } catch (err) {
+    syncError.value = String(err);
+  } finally {
+    syncing.value = false;
   }
 };
 
@@ -111,7 +152,7 @@ const closeSuggestions = () => {
       <div class="brand-zone">
         <div class="logo-icon">▲</div>
         <div class="brand-text">
-          <h2>ZACH CLUSTER</h2>
+          <h2>OPUS MAGNUM</h2>
           <span>LEADERBOARD TERMINAL v2.5</span>
         </div>
       </div>
@@ -139,6 +180,7 @@ const closeSuggestions = () => {
           </div>
           <button @click="handleEnterKey" :disabled="loading || !searchKeyword.trim()" class="btn-execute">EXECUTE</button>
           <button @click="forceRefresh = !forceRefresh; if (forceRefresh) executeRefresh()" class="btn-execute" style="margin-top:6px" :class="{ active: forceRefresh }">REFRESH</button>
+          <button @click="syncNow" :disabled="syncing" class="btn-execute btn-sync" style="margin-top:6px">{{ syncing ? 'SYNCING…' : 'SYNC' }}</button>
         </div>
       </div>
       <div class="status-zone">
@@ -148,8 +190,20 @@ const closeSuggestions = () => {
           <span class="status-text">{{ !bootReady ? "SYNCING" : loading ? "FETCHING" : errorMessage ? "MISMATCH" : "READY" }}</span>
         </div>
         <p v-if="errorMessage" class="error-details">> {{ errorMessage }}</p>
+        <div v-if="lastSyncResult" class="sync-result">
+          <p class="sync-summary">SYNC: +{{ lastSyncResult.newCount }} / -{{ lastSyncResult.removedCount }}</p>
+          <p v-if="lastSyncResult.errors.length > 0" class="sync-errors">
+            <span v-for="(e, i) in lastSyncResult.errors" :key="i">⚠ {{ e }}</span>
+          </p>
+        </div>
+        <p v-if="syncError" class="error-details">> SYNC: {{ syncError }}</p>
         <p class="cache-path">CACHE: {{ cachePath }}</p>
-        <p class="cache-path">{{ cacheInfo }}</p>
+        <div class="timezone-switch">
+          <span class="tz-label">TZ</span>
+          <button :class="{ active: timezoneMode === 'UTC' }" @click="timezoneMode = 'UTC'">UTC</button>
+          <button :class="{ active: timezoneMode === 'BEIJING' }" @click="timezoneMode = 'BEIJING'">UTC+8</button>
+        </div>
+        <p class="cache-ts">{{ formattedCacheInfo }}</p>
       </div>
     </aside>
     <main class="main-workspace">
@@ -187,11 +241,23 @@ body { margin: 0; padding: 0; background-color: var(--bg-deep); color: var(--col
 .btn-execute { background-color: var(--color-primary); color: #000; border: none; padding: 12px; border-radius: 4px; font-weight: bold; cursor: pointer; }
 .btn-execute:hover { background-color: var(--color-accent); }
 .btn-execute.active { background-color: #ffb703; color: #000; }
+.btn-execute:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-sync { background-color: #7c3aed; color: #fff; }
+.btn-sync:hover { background-color: #a78bfa; }
 
 .status-card { background-color: var(--bg-input); border: 1px solid var(--border-color); padding: 12px; border-radius: 4px; display: flex; align-items: center; gap: 12px; }
 .pulse-light { width: 8px; height: 8px; border-radius: 50%; } .pulse-light.success { background-color: var(--color-accent); } .pulse-light.warning { background-color: var(--color-warn); animation: pulse 1s infinite; } .pulse-light.danger { background-color: var(--color-danger); } .pulse-light.syncing { background-color: var(--color-primary); animation: pulse 0.6s infinite; }
 .status-text { font-size: 0.85rem; } .error-details { color: var(--color-danger); font-size: 0.75rem; margin: 6px 0 0 0; }
+.sync-result { margin-top: 8px; }
+.sync-summary { color: var(--color-accent); font-size: 0.78rem; margin: 0; }
+.sync-errors { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 0 0; }
+.sync-errors span { color: var(--color-warn); font-size: 0.68rem; }
 .cache-path { color: #4e5d78; font-size: 0.65rem; margin: 8px 0 0 0; word-break: break-all; }
+.cache-ts { color: #00f5d4; font-size: 0.75rem; font-weight: bold; margin: 8px 0 0 0; font-family: monospace; }
+.timezone-switch { display: flex; align-items: center; gap: 4px; margin-top: 10px; }
+.tz-label { color: #4e5d78; font-size: 0.65rem; margin-right: 4px; }
+.timezone-switch button { background: #0a0d14; border: 1px solid #262e3f; color: #4e5d78; padding: 2px 8px; border-radius: 3px; cursor: pointer; font: inherit; font-size: 0.65rem; }
+.timezone-switch button.active { background: #00b4d8; color: #000; border-color: #00b4d8; }
 .main-workspace { display: flex; flex-direction: column; height: 100vh; background-color: var(--bg-deep); }
 .workspace-header { background-color: var(--bg-panel); border-bottom: 1px solid var(--border-color); padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; }
 .breadcrumb { color: var(--color-accent); font-weight: bold; } .timestamp { color: var(--color-text-muted); }

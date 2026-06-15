@@ -1,16 +1,55 @@
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted } from "vue";
 import { OmRecordDTO } from "../types/om";
+import DraftJudgePanel from "./DraftJudgePanel.vue";
 
 const props = defineProps<{
   records: OmRecordDTO[];
 }>();
 
-const viewMode = ref<"all" | "pareto">("all");
+const viewMode = ref<"all" | "pareto" | "judge">("all");
 const sortExpr = ref("CG");
 const sortOrder = ref<"asc" | "desc">("asc");
 
 const METRICS: Record<string, string> = { G:"cost", C:"cycles", A:"area", I:"instructions", H:"height", W:"width", B:"bounding", R:"rate" };
+
+// ── 完整指标注册表：所有可显示指标的定义 ──
+interface MetricDef {
+  key: string;
+  short: string;
+  label: string;
+  nullable: boolean;
+}
+const ALL_METRICS: MetricDef[] = [
+  { key: "cost",    short: "G",  label: "Cost",   nullable: false },
+  { key: "cycles",  short: "C",  label: "Cycles", nullable: false },
+  { key: "area",    short: "A",  label: "Area",   nullable: false },
+  { key: "instructions", short: "I",  label: "Instr",  nullable: false },
+  { key: "height",  short: "H",  label: "Height", nullable: true },
+  { key: "width",   short: "W",  label: "Width",  nullable: true },
+  { key: "boundingHex", short: "B", label: "Bound", nullable: true },
+  { key: "rate",    short: "R",  label: "Rate",   nullable: true },
+];
+
+// ── 从 score 中安全取值 ──
+const getMetricVal = (s: Record<string, any>, key: string): number | null => {
+  const v = s[key];
+  return (v === null || v === undefined) ? null : (Number(v) as number);
+};
+
+// ── 用户可见指标配置（默认全部开启，有数据的指标自动生效）──
+const visibleMetrics = ref<Set<string>>(new Set(ALL_METRICS.map(m => m.key)));
+const showMetricSettings = ref(true); // 默认展开设置面板
+
+const toggleMetric = (key: string) => {
+  const next = new Set(visibleMetrics.value);
+  if (next.has(key)) {
+    if (next.size > 1) next.delete(key);
+  } else {
+    next.add(key);
+  }
+  visibleMetrics.value = next;
+};
 const parseSortKeys = () => {
   let expr = sortExpr.value.toUpperCase();
   expr = expr.replace(/S4/g, "CGAI").replace(/S/g, "CGA");
@@ -40,8 +79,40 @@ const xMode = computed(() => {
   return null;
 });
 const filterTrackless = ref(false);
-const filterOverlap = ref(true);
+const showOverlapOnly = ref(false); // 默认不按=只显示非O; 按下=只显示O
 const scoreView = ref<"both" | "v" | "inf">("both");
+
+// ── 当前视图下的基准最优值 ──
+// 对每个指标独立计算历史最小值；仅当数据集中至少有一条记录在该指标上有非空值时才纳入
+const benchmarks = computed(() => {
+  const scored = props.records.filter(r => r.score !== null);
+  let pool = showOverlapOnly.value ? scored.filter(r => r.score!.overlap) : scored.filter(r => !r.score!.overlap);
+  if (filterTrackless.value) {
+    pool = pool.filter(r => r.score!.trackless);
+  }
+  if (pool.length === 0) return null;
+  const result: Record<string, number> = {};
+  for (const m of ALL_METRICS) {
+    const vals = pool.map(r => getMetricVal(r.score!, m.key)).filter(v => v !== null) as number[];
+    if (vals.length > 0) {
+      result[m.key] = Math.min(...vals);
+    }
+  }
+  return result;
+});
+
+// ── 当前可见指标列表（用户勾选的 + 数据集中确实有值的）──
+const activeMetrics = computed(() => {
+  if (!benchmarks.value) return [];
+  return ALL_METRICS.filter(m => visibleMetrics.value.has(m.key) && benchmarks.value![m.key] !== undefined);
+});
+
+// ── 计算单指标劣化百分比 ──
+const pctStr = (val: number, bench: number) => {
+  if (bench === 0) return "";
+  const p = (val / bench) * 100;
+  return p === 100 ? "" : ` (${p.toFixed(0)}%)`;
+};
 
 // 解析 fullFormattedScore 为 @V / @∞ 两部分（按空格切分）
 const splitScore = (raw: string | null) => {
@@ -77,7 +148,9 @@ const aggregatedRecords = computed(() => {
   if (filterTrackless.value) {
     baseList = baseList.filter(r => r.score!.trackless);
   }
-  if (filterOverlap.value) {
+  if (showOverlapOnly.value) {
+    baseList = baseList.filter(r => r.score!.overlap);
+  } else {
     baseList = baseList.filter(r => !r.score!.overlap);
   }
 
@@ -177,7 +250,8 @@ const aggregatedRecords = computed(() => {
 
 const puzzleInfo = computed(() => {
   if (props.records.length === 0) return null;
-  const p = props.records[0].puzzle;
+  const p = props.records.find(r => r.puzzle !== null)?.puzzle;
+  if (!p) return null;
   return { id: p.id, name: p.displayName, chapter: p.group.displayName };
 });
 
@@ -231,6 +305,7 @@ const handleHeaderClick = (expr: string) => {
         <div class="view-mode-selector">
           <button class="mode-btn" :class="{ active: viewMode === 'all' }" @click="viewMode = 'all'">RECORD</button>
           <button class="mode-btn" :class="{ active: viewMode === 'pareto' }" @click="viewMode = 'pareto'">FRONTIER</button>
+          <button class="mode-btn mode-judge" :class="{ active: viewMode === 'judge' }" @click="viewMode = 'judge'">PARETO JUDGE</button>
         </div>
       </div>
       <div class="dashboard-group score-view-group">
@@ -243,9 +318,9 @@ const handleHeaderClick = (expr: string) => {
           <input type="checkbox" v-model="filterTrackless" />
           <span>T</span>
         </label>
-        <label class="filter-checkbox" :class="{ checked: filterOverlap }">
-          <input type="checkbox" v-model="filterOverlap" />
-          <span>!O</span>
+        <label class="filter-checkbox" :class="{ checked: showOverlapOnly }">
+          <input type="checkbox" v-model="showOverlapOnly" />
+          <span>O</span>
         </label>
       </div>
       <div class="dashboard-group sort-selector">
@@ -265,8 +340,27 @@ const handleHeaderClick = (expr: string) => {
       <span class="puzzle-id">#{{ puzzleInfo.id }}</span>
     </div>
 
+    <!-- 基准最优值条 + 指标设置 -->
+    <div v-if="benchmarks" class="benchmark-bar">
+      <span class="bench-label">BEST</span>
+      <span v-for="m in activeMetrics" :key="m.key" class="bench-val">{{ m.short }}:{{ benchmarks[m.key] }}</span>
+      <button class="bench-settings-btn" @click="showMetricSettings = !showMetricSettings" :class="{ active: showMetricSettings }">⚙</button>
+    </div>
+    <!-- 指标勾选面板 -->
+    <div v-if="showMetricSettings && benchmarks" class="metric-settings">
+      <label v-for="m in ALL_METRICS" :key="m.key" class="metric-check" :class="{ checked: visibleMetrics.has(m.key), disabled: !benchmarks[m.key] }" :title="!benchmarks[m.key] ? '数据集中无此指标' : ''">
+        <input type="checkbox" :checked="visibleMetrics.has(m.key)" @change="toggleMetric(m.key)" :disabled="!benchmarks[m.key]" />
+        <span>{{ m.short }}:{{ m.label }}</span>
+      </label>
+    </div>
+
     <div class="matrix-container">
-      <table class="matrix-table">
+      <!-- PARETO JUDGE 视图 -->
+      <div v-if="viewMode === 'judge'" class="judge-view-wrapper">
+        <DraftJudgePanel :puzzle-id="puzzleInfo?.id || ''" />
+      </div>
+      <!-- 记录表格视图 -->
+      <table v-else class="matrix-table">
         <thead>
           <tr>
             <th style="width: 18%">CATEGORY</th>
@@ -288,7 +382,15 @@ const handleHeaderClick = (expr: string) => {
                 <span v-if="scoreView !== 'v' && splitScore(item.record.fullFormattedScore).inf" class="score-line score-inf">{{ splitScore(item.record.fullFormattedScore).inf }}</span>
               </template>
               <template v-else>
-                <span class="score-full">{{ item.record.score!.cost }}g/{{ item.record.score!.cycles }}c/{{ item.record.score!.area }}a/{{ item.record.score!.instructions }}i<span v-if="item.record.score!.height != null">/{{ item.record.score!.height }}h</span><span v-if="item.record.score!.width != null">/{{ item.record.score!.width }}w</span><span v-if="item.record.score!.boundingHex != null">/{{ item.record.score!.boundingHex }}b</span><span v-if="item.record.score!.trackless">/T</span><span v-if="!item.record.score!.overlap">/L</span></span>
+                <span class="score-full">
+                  <template v-for="(m, idx) in activeMetrics" :key="m.key">
+                    <span v-if="idx > 0">/</span>
+                    <span>{{ getMetricVal(item.record.score!, m.key) }}{{ m.short.toLowerCase() }}</span>
+                    <span v-if="benchmarks && benchmarks[m.key] !== undefined">{{ pctStr(getMetricVal(item.record.score!, m.key) ?? 0, benchmarks[m.key]) }}</span>
+                  </template>
+                  <span v-if="item.record.score!.trackless">/T</span>
+                  <span v-if="!item.record.score!.overlap">/L</span>
+                </span>
               </template>
             </td>
             <td class="num-val">{{ item.derived.sum }}</td>
@@ -348,6 +450,8 @@ const handleHeaderClick = (expr: string) => {
 .view-mode-selector { display: flex; background-color: #0a0d14; padding: 2px; border-radius: 4px; border: 1px solid #262e3f; }
 .mode-btn { background: none; border: none; color: #4e5d78; padding: 5px 12px; font-family: monospace; font-size: 0.78rem; font-weight: bold; cursor: pointer; border-radius: 3px; }
 .mode-btn.active { background-color: #00b4d8; color: #000; }
+.mode-judge.active { background-color: #7c3aed; color: #fff; }
+.judge-view-wrapper { padding: 8px; }
 .control-text { font-family: monospace; font-size: 0.75rem; color: #4e5d78; margin-right: 4px; }
 .sort-input { background-color: #0a0d14; color: #e2e8f0; border: 1px solid #262e3f; padding: 4px 8px; border-radius: 4px; font-family: monospace; font-size: 0.75rem; outline: none; width: 80px; }
 .sort-input:focus { border-color: #00b4d8; }
@@ -370,6 +474,17 @@ th { background-color: #161a22; color: #4e5d78; font-size: 0.75rem; font-weight:
 .puzzle-sep { color: #262e3f; }
 .puzzle-name { color: #e2e8f0; font-weight: bold; }
 .puzzle-id { color: #00b4d8; margin-left: 8px; font-size: 0.72rem; }
+.benchmark-bar { background: #0a0d14; border: 1px solid #1a1f2c; border-radius: 3px; padding: 6px 12px; margin-bottom: 8px; display: flex; align-items: center; gap: 14px; font-size: 0.75rem; }
+.bench-label { color: #ffb703; font-weight: bold; }
+.bench-val { color: #00f5d4; font-family: monospace; }
+.bench-settings-btn { background: none; border: 1px solid #262e3f; color: #4e5d78; cursor: pointer; font-size: 0.75rem; padding: 0 6px; border-radius: 3px; margin-left: auto; }
+.bench-settings-btn:hover { color: #ffb703; border-color: #ffb703; }
+.bench-settings-btn.active { color: #ffb703; border-color: #ffb703; background: rgba(255,183,3,0.06); }
+.metric-settings { background: #0a0d14; border: 1px solid #1a1f2c; border-radius: 3px; padding: 6px 12px; margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 10px; }
+.metric-check { display: flex; align-items: center; gap: 3px; cursor: pointer; font-family: monospace; font-size: 0.7rem; color: #4e5d78; }
+.metric-check input { display: none; }
+.metric-check.checked { color: #00f5d4; }
+.metric-check.disabled { opacity: 0.25; cursor: not-allowed; }
 
 
 .matrix-empty { text-align: center; color: #4e5d78; padding: 40px; font-style: italic; }
