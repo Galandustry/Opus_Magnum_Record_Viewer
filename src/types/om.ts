@@ -119,3 +119,19 @@ export interface SubmitResult {
   result: SubmitStatus;
   message: string | null;
 }
+
+export interface LambdaAlly {
+  recordId: string;
+  author: string;
+  scoreLabel: string;
+  weight: number;
+  metricValues: Record<string, number>;
+}
+
+export interface NavigatorResult {
+  isWeak: boolean;
+  weaknessGap: number;
+  convexHullSize: number;
+  lambdaAllies: LambdaAlly[];
+  deltaMetrics: Record<string, number>;
+}

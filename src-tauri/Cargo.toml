@@ -32,3 +32,4 @@ chrono = "0.4"
 
 # 引入 rusqlite，并开启 bundled 特性（这样它会在编译时自动锁死嵌入 sqlite 源码，无需用户在 Windows 操作系统上配置复杂的 sqlite3.dll 环境，真正做到解压即用、可自由分享）
 rusqlite = { version = "0.32", features = ["bundled"] }
+good_lp = { version = "1", default-features = false, features = ["minilp"] }

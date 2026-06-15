@@ -341,6 +341,7 @@ const allFilled = (): boolean => activeMetrics.value.every(m => {
     <div v-else-if="!loading" class="idle-hint">
       Fill in your scores and press JUDGE
     </div>
+
   </div>
 </template>
 

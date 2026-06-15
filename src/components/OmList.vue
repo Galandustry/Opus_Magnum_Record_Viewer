@@ -3,6 +3,7 @@ import { ref, computed, watch, onUnmounted } from "vue";
 import { OmRecordDTO } from "../types/om";
 import type { RadarChartData } from "../types/om";
 import DraftJudgePanel from "./DraftJudgePanel.vue";
+import NavigatorPanel from "./NavigatorPanel.vue";
 import OmRadar from "./OmRadar.vue";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -10,7 +11,7 @@ const props = defineProps<{
   records: OmRecordDTO[];
 }>();
 
-const viewMode = ref<"all" | "pareto" | "judge">("all");
+const viewMode = ref<"all" | "pareto" | "judge" | "navigator">("all");
 const sortExpr = ref("CG");
 const sortOrder = ref<"asc" | "desc">("asc");
 
@@ -358,6 +359,7 @@ const handleHeaderClick = (expr: string) => {
           <button class="mode-btn" :class="{ active: viewMode === 'all' }" @click="viewMode = 'all'">RECORD</button>
           <button class="mode-btn" :class="{ active: viewMode === 'pareto' }" @click="viewMode = 'pareto'">FRONTIER</button>
           <button class="mode-btn mode-judge" :class="{ active: viewMode === 'judge' }" @click="viewMode = 'judge'">PARETO JUDGE</button>
+          <button class="mode-btn mode-nav" :class="{ active: viewMode === 'navigator' }" @click="viewMode = 'navigator'">NAVIGATOR</button>
         </div>
       </div>
       <div class="dashboard-group score-view-group">
@@ -408,11 +410,15 @@ const handleHeaderClick = (expr: string) => {
 
     <div class="matrix-container">
       <!-- PARETO JUDGE 视图 -->
-      <div v-if="viewMode === 'judge'" class="judge-view-wrapper">
+      <div v-show="viewMode === 'judge'" class="judge-view-wrapper">
         <DraftJudgePanel :puzzle-id="puzzleInfo?.id || ''" :puzzle-name="puzzleInfo?.name || ''" />
       </div>
+      <!-- NAVIGATOR 视图 -->
+      <div v-show="viewMode === 'navigator'" class="judge-view-wrapper">
+        <NavigatorPanel :puzzle-id="puzzleInfo?.id || ''" :records="records" />
+      </div>
       <!-- 记录表格视图 -->
-      <table v-else class="matrix-table">
+      <table v-show="viewMode !== 'judge' && viewMode !== 'navigator'" class="matrix-table">
         <thead>
           <tr>
             <th style="width: 18%">CATEGORY</th>
@@ -517,6 +523,8 @@ const handleHeaderClick = (expr: string) => {
 .mode-btn { background: none; border: none; color: #4e5d78; padding: 5px 12px; font-family: monospace; font-size: 0.78rem; font-weight: bold; cursor: pointer; border-radius: 3px; }
 .mode-btn.active { background-color: #00b4d8; color: #000; }
 .mode-judge.active { background-color: #7c3aed; color: #fff; }
+.mode-nav { color: #6d28d9; }
+.mode-nav.active { background-color: #6d28d9; color: #fff; }
 .judge-view-wrapper { padding: 8px; }
 .control-text { font-family: monospace; font-size: 0.75rem; color: #4e5d78; margin-right: 4px; }
 .sort-input { background-color: #0a0d14; color: #e2e8f0; border: 1px solid #262e3f; padding: 4px 8px; border-radius: 4px; font-family: monospace; font-size: 0.75rem; outline: none; width: 80px; }

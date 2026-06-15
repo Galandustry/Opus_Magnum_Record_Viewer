@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::path::PathBuf;
 use tauri::Manager;
+use good_lp::{variables, variable, Expression, Solution, SolverModel};
 
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -580,7 +581,8 @@ async fn judge_draft(
                     let s = r.score.as_ref().unwrap();
                     let overlap_match = s.overlap == draft.overlap;
                     let trackless_match = if draft.trackless { s.trackless } else { true };
-                    overlap_match && trackless_match
+                    let base_valid = s.cost > 0 && s.cycles > 0 && s.area > 0 && s.instructions > 0;
+                    overlap_match && trackless_match && base_valid
                 }
         }).cloned().collect()
     }; // ← 锁在此处释放
@@ -928,6 +930,299 @@ async fn get_record_radar_chart(
         draft_raw,
     });
 }
+// ================= Pareto Navigator: 8D LP 凹包薄弱分析 =================
+
+const DIM_COUNT: usize = 8;
+
+fn extract_8d(s: &OmScoreDTO) -> [f64; DIM_COUNT] {
+    [
+        s.cost as f64, s.cycles as f64, s.area as f64, s.instructions as f64,
+        s.height.unwrap_or(0) as f64, s.width.unwrap_or(0.0),
+        s.bounding_hex.unwrap_or(0) as f64, s.rate.unwrap_or(0.0),
+    ]
+}
+
+fn analyze_8d_pareto_weakness(
+    draft: &OmDraftInput,
+    candidates: &[OmRecordDTO],
+) -> Option<(f64, Vec<f64>, Vec<f64>, usize, usize)> {
+    let dim_map: std::collections::HashMap<&str, usize> = [
+        ("cost", 0), ("cycles", 1), ("area", 2), ("instructions", 3),
+        ("height", 4), ("width", 5), ("boundingHex", 6), ("rate", 7),
+    ].into_iter().collect();
+
+    let dim_indices: Vec<usize> = draft.active_metrics.iter()
+        .filter_map(|k| dim_map.get(k.as_str()).copied()).collect();
+    if dim_indices.is_empty() { return None; }
+
+    // Pareto Front 提取：T/O过滤 → 数据完整性检查 → 剔除非前沿支配点
+    let mut frontier: Vec<&OmScoreDTO> = Vec::new();
+    let mut frontier_to_ci: Vec<usize> = Vec::new(); // frontier[i] → candidates 索引
+    {
+        for (ci, c) in candidates.iter().enumerate() {
+            if let Some(s) = &c.score {
+                let ok = s.overlap == draft.overlap && (!draft.trackless || s.trackless);
+                let base_valid = s.cost > 0 && s.cycles > 0 && s.area > 0 && s.instructions > 0;
+                let mut has_all = base_valid;
+                for &idx in &dim_indices {
+                    match idx {
+                        4 => if s.height.is_none() { has_all = false; },
+                        5 => if s.width.is_none() { has_all = false; },
+                        6 => if s.bounding_hex.is_none() { has_all = false; },
+                        7 => if s.rate.is_none() { has_all = false; },
+                        _ => {}
+                    }
+                }
+                if ok && has_all { frontier.push(s); frontier_to_ci.push(ci); }
+            }
+        }
+    }
+    // 剔除非前沿的被支配点
+    {
+        let nf = frontier.len();
+        let mut keep = vec![true; nf];
+        println!("[PARETO_FILTER] {} candidates before dominance check", nf);
+        for i in 0..nf {
+            if !keep[i] { continue; }
+            for j in 0..nf {
+                if i == j || !keep[j] { continue; }
+                let mut any_strict = false;
+                let mut dominates = true;
+                for &idx in &dim_indices {
+                    let vi = match idx {
+                        0 => frontier[i].cost as f64, 1 => frontier[i].cycles as f64,
+                        2 => frontier[i].area as f64, 3 => frontier[i].instructions as f64,
+                        4 => frontier[i].height.unwrap_or(0) as f64, 5 => frontier[i].width.unwrap_or(0.0),
+                        6 => frontier[i].bounding_hex.unwrap_or(0) as f64, 7 => frontier[i].rate.unwrap_or(0.0),
+                        _ => 0.0
+                    };
+                    let vj = match idx {
+                        0 => frontier[j].cost as f64, 1 => frontier[j].cycles as f64,
+                        2 => frontier[j].area as f64, 3 => frontier[j].instructions as f64,
+                        4 => frontier[j].height.unwrap_or(0) as f64, 5 => frontier[j].width.unwrap_or(0.0),
+                        6 => frontier[j].bounding_hex.unwrap_or(0) as f64, 7 => frontier[j].rate.unwrap_or(0.0),
+                        _ => 0.0
+                    };
+                    if vi < vj - 1e-9 { dominates = false; break; }
+                    if vj < vi - 1e-9 { any_strict = true; }
+                }
+                if dominates && any_strict {
+                    let iv: Vec<String> = dim_indices.iter().map(|&idx| {
+                        let v = extract_8d(frontier[i])[idx];
+                        if v.fract() == 0.0 { format!("{:.0}", v) } else { format!("{:.1}", v) }
+                    }).collect();
+                    let jv: Vec<String> = dim_indices.iter().map(|&idx| {
+                        let v = extract_8d(frontier[j])[idx];
+                        if v.fract() == 0.0 { format!("{:.0}", v) } else { format!("{:.1}", v) }
+                    }).collect();
+                    println!("  REMOVE [{}] ({}) dominated by [{}] ({})", i, iv.join(","), j, jv.join(","));
+                    keep[i] = false; break;
+                }
+            }
+        }
+        let mut new_frontier = Vec::new();
+        let mut new_f2c = Vec::new();
+        for i in 0..nf {
+            if keep[i] {
+                let vals: Vec<String> = dim_indices.iter().map(|&idx| {
+                    let v = extract_8d(frontier[i])[idx];
+                    if v.fract() == 0.0 { format!("{:.0}", v) } else { format!("{:.1}", v) }
+                }).collect();
+                println!("  KEEP [{}] ({})", i, vals.join(","));
+                new_frontier.push(frontier[i]); new_f2c.push(frontier_to_ci[i]);
+            }
+        }
+        println!("[PARETO_FILTER] {} kept after dominance check", new_frontier.len());
+        frontier = new_frontier;
+        frontier_to_ci = new_f2c;
+    }
+    // 去重：相同坐标的前沿点只保留第一个
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut dedup_frontier = Vec::new();
+        let mut dedup_f2c = Vec::new();
+        for (i, f) in frontier.iter().enumerate() {
+            let key: Vec<i64> = dim_indices.iter().map(|&j| {
+                (extract_8d(f)[j] * 1000.0) as i64
+            }).collect();
+            if seen.insert(key) {
+                dedup_frontier.push(*f);
+                dedup_f2c.push(frontier_to_ci[i]);
+            }
+        }
+        frontier = dedup_frontier;
+        frontier_to_ci = dedup_f2c;
+    }
+    if frontier.is_empty() { return None; }
+
+    let raw_draft = [
+        draft.cost.unwrap_or(0) as f64, draft.cycles.unwrap_or(0) as f64,
+        draft.area.unwrap_or(0) as f64, draft.instructions.unwrap_or(0) as f64,
+        draft.height.unwrap_or(0) as f64, draft.width.unwrap_or(0.0),
+        draft.bounding_hex.unwrap_or(0) as f64, draft.rate.unwrap_or(0.0),
+    ];
+
+    if frontier.is_empty() { return None; }
+
+    // 🐛 调试：打印 frontier 点集
+    println!("[NAV_FRONTIER] draft=({}) frontier={} pool={}",
+        dim_indices.iter().map(|&j| {
+            let v = raw_draft[j];
+            if v.fract() == 0.0 { format!("{:.0}", v) } else { format!("{:.1}", v) }
+        }).collect::<Vec<_>>().join(","),
+        frontier.len(), candidates.len());
+    for (fi, f) in frontier.iter().enumerate() {
+        let vals: Vec<String> = dim_indices.iter().map(|&j| {
+            let v = extract_8d(f)[j];
+            if v.fract() == 0.0 { format!("{:.0}", v) } else { format!("{:.1}", v) }
+        }).collect();
+        println!("  [{}] ({})", fi, vals.join(","));
+    }
+
+    let log_draft: Vec<f64> = raw_draft.iter().map(|&v| v.max(1.0).ln()).collect();
+    let log_cands: Vec<Vec<f64>> = frontier.iter()
+        .map(|s| extract_8d(s).iter().map(|&v| v.max(1.0).ln()).collect())
+        .collect();
+
+    let n = log_cands.len();
+    let mut problem = variables!();
+    let alpha = problem.add(variable().min(f64::NEG_INFINITY).max(f64::INFINITY));
+    let lambdas: Vec<_> = (0..n).map(|_| problem.add(variable().min(0.0).max(1.0))).collect();
+
+    let sum_lambdas: Expression = lambdas.iter().cloned().sum();
+    let mut solver = problem.maximise(alpha).using(good_lp::default_solver);
+    solver = solver.with(sum_lambdas.eq(1.0));
+
+    for &j in &dim_indices {
+        let mut combined = Expression::from(0.0);
+        for i in 0..n { combined = combined + lambdas[i] * log_cands[i][j]; }
+        solver = solver.with((combined + alpha).leq(log_draft[j]));
+    }
+
+    match solver.solve() {
+        Ok(solution) => {
+            let max_alpha = solution.value(alpha);
+            if max_alpha > 1e-7 {
+                let weights: Vec<f64> = (0..n).map(|i| solution.value(lambdas[i])).collect();
+
+                let mut full_weights = vec![0.0; candidates.len()];
+                for (fi, &ci) in frontier_to_ci.iter().enumerate() {
+                    if fi < weights.len() { full_weights[ci] = weights[fi]; }
+                }
+
+                // P_target: λ 的几何加权组合
+                let p_target: Vec<f64> = (0..DIM_COUNT).map(|j| {
+                    let mut log_sum = 0.0;
+                    for i in 0..n {
+                        if weights[i] > 1e-5 {
+                            log_sum += weights[i] * (extract_8d(frontier[i])[j].max(1.0).ln());
+                        }
+                    }
+                    log_sum.exp()
+                }).collect();
+                Some((max_alpha, full_weights, p_target, frontier.len(), candidates.len()))
+            } else { None }
+        }
+        Err(_) => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LambdaAlly {
+    pub record_id: String,
+    pub author: String,
+    pub score_label: String,
+    pub weight: f64,
+    pub metric_values: std::collections::HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigatorResult {
+    pub is_weak: bool,
+    pub weakness_gap: f64,
+    pub convex_hull_size: usize,
+    pub lambda_allies: Vec<LambdaAlly>,
+    pub delta_metrics: std::collections::HashMap<String, f64>,
+}
+
+#[tauri::command]
+async fn navigate_pareto(
+    draft: OmDraftInput,
+    puzzle_id: String,
+    state: tauri::State<'_, MemoryState>,
+) -> Result<NavigatorResult, String> {
+    let candidates: Vec<OmRecordDTO> = {
+        let vault = state.record_vault.lock().unwrap();
+        vault.iter().filter(|r| {
+            r.puzzle.as_ref().map_or(false, |p| p.id == puzzle_id)
+            && r.score.is_some()
+            && {
+                let s = r.score.as_ref().unwrap();
+                // 排除草稿自身
+                let is_self = s.cost == draft.cost.unwrap_or(-1)
+                    && s.cycles == draft.cycles.unwrap_or(-1)
+                    && s.area == draft.area.unwrap_or(-1)
+                    && s.instructions == draft.instructions.unwrap_or(-1)
+                    && s.overlap == draft.overlap
+                    && s.trackless == draft.trackless;
+                !is_self
+                && s.overlap == draft.overlap && (!draft.trackless || s.trackless)
+                && s.cost > 0 && s.cycles > 0 && s.area > 0 && s.instructions > 0
+            }
+        }).cloned().collect()
+    };
+
+    if candidates.is_empty() {
+        return Ok(NavigatorResult { is_weak: false, weakness_gap: 0.0, convex_hull_size: 0, lambda_allies: vec![], delta_metrics: std::collections::HashMap::new() });
+    }
+
+    match analyze_8d_pareto_weakness(&draft, &candidates) {
+        Some((gap, lambdas, p_target, frontier_sz, _pool_sz)) => {
+            let allies: Vec<LambdaAlly> = lambdas.iter().enumerate()
+                .filter(|(_, &w)| w > 1e-6)
+                .map(|(i, &w)| {
+                    let rec = &candidates[i];
+                    let sid = rec.id.clone().unwrap_or_default();
+                    let author = rec.author.clone().unwrap_or_default();
+                    let label = rec.full_formatted_score.clone().unwrap_or_else(|| {
+                        rec.score.as_ref().map(|s| format!("{}g/{}c/{}a", s.cost, s.cycles, s.area)).unwrap_or_default()
+                    });
+                    let mut mv = std::collections::HashMap::new();
+                    if let Some(s) = &rec.score {
+                        mv.insert("cost".into(), s.cost as f64);
+                        mv.insert("cycles".into(), s.cycles as f64);
+                        mv.insert("area".into(), s.area as f64);
+                        mv.insert("instructions".into(), s.instructions as f64);
+                        mv.insert("height".into(), s.height.unwrap_or(0) as f64);
+                        mv.insert("width".into(), s.width.unwrap_or(0.0));
+                        mv.insert("boundingHex".into(), s.bounding_hex.unwrap_or(0) as f64);
+                        mv.insert("rate".into(), s.rate.unwrap_or(0.0));
+                    }
+                    LambdaAlly { record_id: sid, author, score_label: label, weight: w, metric_values: mv }
+                })
+                .collect();
+
+            let draft_raw = [
+                draft.cost.unwrap_or(0) as f64, draft.cycles.unwrap_or(0) as f64,
+                draft.area.unwrap_or(0) as f64, draft.instructions.unwrap_or(0) as f64,
+                draft.height.unwrap_or(0) as f64, draft.width.unwrap_or(0.0),
+                draft.bounding_hex.unwrap_or(0) as f64, draft.rate.unwrap_or(0.0),
+            ];
+            let dim_keys = ["cost","cycles","area","instructions","height","width","boundingHex","rate"];
+            let sel_set: std::collections::HashSet<&str> = draft.active_metrics.iter().map(|s| s.as_str()).collect();
+            let mut delta_metrics = std::collections::HashMap::new();
+            for (j, &k) in dim_keys.iter().enumerate() {
+                let delta = if sel_set.contains(k) { p_target[j] - draft_raw[j] } else { 0.0 };
+                delta_metrics.insert(k.to_string(), delta);
+            }
+
+            Ok(NavigatorResult { is_weak: true, weakness_gap: gap, convex_hull_size: frontier_sz, lambda_allies: allies, delta_metrics })
+        },
+        None => Ok(NavigatorResult { is_weak: false, weakness_gap: 0.0, convex_hull_size: 0, lambda_allies: vec![], delta_metrics: std::collections::HashMap::new() }),
+    }
+}
 
 // ================= 6. App 启动阶段 =================
 
@@ -1036,7 +1331,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![search_om_records, sync_incremental, judge_draft, save_puzzle_best, load_puzzle_best, get_live_puzzle_suggestions, check_boot_ready, get_cache_path, get_cache_info, get_record_radar_chart])
+        .invoke_handler(tauri::generate_handler![search_om_records, sync_incremental, judge_draft, save_puzzle_best, load_puzzle_best, get_live_puzzle_suggestions, check_boot_ready, get_cache_path, get_cache_info, get_record_radar_chart, navigate_pareto])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
